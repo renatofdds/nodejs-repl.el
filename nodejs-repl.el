@@ -80,12 +80,23 @@ If it is a symbol of a function, the function is called for the path of the
 Node.js command. This allows to integrate with a Node.js version manager
 such as nvm."
   :group 'nodejs-repl
-  :type 'string)
+  :type '(choice string function))
+
+;;;###autoload
+(defcustom nodejs-repl-transform-imports t
+  "When non-nil, transform static imports to dynamic imports in the REPL."
+  :type 'boolean
+  :group 'nodejs-repl)
 
 (defcustom nodejs-repl-arguments '()
   "Command line parameters forwarded to `nodejs-repl-command'."
   :group 'nodejs-repl
   :type '(repeat string))
+
+(defcustom nodejs-repl-env nil
+  "Alist of environment variables to be set."
+  :group 'nodejs-repl
+  :type '(alist :key-type string :value-type string))
 
 (defcustom nodejs-repl-prompt "> "
   "Node.js prompt used in `nodejs-repl-mode'."
@@ -152,8 +163,10 @@ See also `comint-process-echoes'"
 ;;; if send string like "a; Ma\t", return a; Math\x1b[1G> a; Math\x1b[0K\x1b[10G
 (defvar nodejs-repl-prompt-re-format
   "\x1b\\[1G\x1b\\[0J%s.*\x1b\\[[0-9]+G.*$")
+
 (defvar nodejs-repl-prompt-re
   (format nodejs-repl-prompt-re-format nodejs-repl-prompt nodejs-repl-prompt))
+
 ;;; not support Unicode characters
 (defvar nodejs-repl-require-re
   (concat
@@ -191,29 +204,94 @@ See also `comint-process-echoes'"
   (if (string-match "\\([._$]\\|\\w\\)+$" string)
       (match-string 0 string)))
 
+(defun nodejs-repl--interact (proc interact)
+	(let* ((orig-marker (marker-position (process-mark proc)))
+				 (orig-filter (process-filter proc))
+				 (orig-buf (process-buffer proc)))
+		(with-temp-buffer
+			(unwind-protect
+					(progn
+						(set-process-buffer proc (current-buffer))
+						(set-process-filter proc 'nodejs-repl--interact-filter)
+						(set-marker (process-mark proc) (point-min))
+						(funcall interact proc))
+				(set-process-buffer proc orig-buf)
+				(set-process-filter proc orig-filter)
+				(set-marker (process-mark proc) orig-marker orig-buf))
+			)))
+
+(defun nodejs-repl--interact-filter (proc string)
+	(when-let* ((buf (process-buffer proc))
+							((buffer-live-p buf)))
+    (with-current-buffer buf
+			(save-excursion
+				(goto-char (process-mark proc))
+				(insert string)
+				(set-marker (process-mark proc) (point))))))
+
+(defun nodejs-repl--await (proc)
+	(when-let* ((buf (process-buffer proc))
+							((buffer-live-p buf)))
+    (with-current-buffer buf
+			(while (and (not (re-search-forward nodejs-repl-prompt-re (process-mark proc) t))
+									(accept-process-output proc 0.1 nil t)))
+			(goto-char (process-mark proc)))))
+
+(defun nodejs-repl--consume (proc)
+	(when-let* ((buf (process-buffer proc))
+							((buffer-live-p buf)))
+    (with-current-buffer buf
+			(save-excursion
+				(while (and (not (re-search-forward nodejs-repl-prompt-re (process-mark proc) t))
+										(accept-process-output proc 0.1 nil t))))
+			(save-excursion
+				(while (re-search-forward nodejs-repl-prompt-re (process-mark proc) t)
+					(delete-line)))
+			(prog1 (replace-regexp-in-string
+							"\\(?:\e\\[[0-9;]*[A-Za-z]\\)"
+							"" (ansi-color-apply (buffer-substring (point) (process-mark proc))) t t)
+				(goto-char (process-mark proc))))))
+
+(defun nodejs-repl--query (proc query)
+	(process-send-string proc (concat query "\n"))
+	(replace-regexp-in-string "\\(?:\r\n\\|[^\r]+\r\r\n\\)" "" (nodejs-repl--consume proc)))
+
+(defmacro nodejs-repl--interaction (proc &rest body)
+	(declare (indent 1) (debug (sexp def-body)))
+	`(nodejs-repl--interact
+		,proc
+		(lambda (proc)
+			(cl-flet ((send (string)
+									(process-send-string proc string))
+								(query (query)
+									(nodejs-repl--query proc query))
+								(exec (command)
+									(process-send-string proc (concat command "\n"))
+									(nodejs-repl--await proc)))
+				,(macroexp-progn body)))))
+
 ;;; TODO:
 ;;; * the case that a command is sent while another command is being prossesed
 ;;; * the case that incomplete commands are sent like "1 +\n"
 ;;; * support commands which output a string without CR-LF like process.stdout.write("a")
 ;;;   while being processed
-(defun nodejs-repl--send-string (string)
+(defun nodejs-repl--send-string (proc string)
   "Send STRING to Node.js process and return the output."
-  (with-temp-buffer
-    (let* ((proc (get-process nodejs-repl-process-name))
-           (orig-marker (marker-position (process-mark proc)))
-           (orig-filter (process-filter proc))
-           (orig-buf (process-buffer proc)))
-      (unwind-protect
-          (progn
-            (set-process-buffer proc (current-buffer))
-            (set-process-filter proc 'nodejs-repl--insert-and-update-status)
-            (set-marker (process-mark proc) (point-min))
-            (process-send-string proc string)
-            (nodejs-repl--wait-for-process proc string 0.01))
-        (set-process-buffer proc orig-buf)
-        (set-process-filter proc orig-filter)
-        (set-marker (process-mark proc) orig-marker orig-buf))
-      (buffer-string))))
+  (let* ((orig-marker (marker-position (process-mark proc)))
+         (orig-filter (process-filter proc))
+         (orig-buf (process-buffer proc)))
+		(with-temp-buffer
+			(unwind-protect
+					(progn
+						(set-process-buffer proc (current-buffer))
+						(set-process-filter proc 'nodejs-repl--insert-and-update-status)
+						(set-marker (process-mark proc) (point-min))
+						(process-send-string proc string)
+						(nodejs-repl--wait-for-process proc string 0.01)
+						(buffer-string))
+				(set-process-buffer proc orig-buf)
+				(set-process-filter proc orig-filter)
+				(set-marker (process-mark proc) orig-marker orig-buf)))))
 
 (defun nodejs-repl--wait-for-process (proc string interval)
   "Wait for Node.js process PROC to output all results."
@@ -241,12 +319,13 @@ when receive the output string."
 
 (defun nodejs-repl--get-completions-from-process (token)
   "Get completions for prefix TOKEN by sending TAB to Node.js process."
-  (let ((ret (progn
-               ;; Send TAB twice cf. https://github.com/nodejs/node/pull/7754
-               (nodejs-repl--send-string (concat token "\t"))
-               (nodejs-repl--send-string "\t")))
-        completions)
-    (nodejs-repl-clear-line)
+  (let* ((proc (get-process nodejs-repl-process-name))
+				 (ret (progn
+								;; Send TAB twice cf. https://github.com/nodejs/node/pull/7754
+								(nodejs-repl--send-string proc (concat token "\t"))
+								(nodejs-repl--send-string proc "\t")))
+         completions)
+    (nodejs-repl--send-string proc "\x1\xb") ; Send ^A ^K to clear line
     (when (not (equal ret token))
       (if (string-match-p "\n" ret)
           (progn
@@ -274,16 +353,14 @@ when receive the output string."
     completions))
 
 (defun nodejs-repl--get-or-create-process ()
-  (let ((proc (get-process nodejs-repl-process-name)))
-    (unless (processp proc)
-      (save-excursion (nodejs-repl))
-      (setq proc (get-process nodejs-repl-process-name)))
-    proc))
+  (or (get-process nodejs-repl-process-name)
+			(save-excursion
+				(nodejs-repl)
+				(get-process nodejs-repl-process-name))))
 
-(defun nodejs-repl--filter-escape-sequnces (_string)
+(defun nodejs-repl--filter-escape-sequences (&optional _string)
   "Filter extra escape sequences from output."
-  (let ((beg (or comint-last-output-start
-                 (point-min-marker)))
+  (let ((beg (or comint-last-output-start (point-min-marker)))
         (end (process-mark (get-buffer-process (current-buffer)))))
     (save-excursion
       (goto-char beg)
@@ -295,9 +372,6 @@ when receive the output string."
   "Clear caches when outputting the result."
   (setq nodejs-repl-cache-token "")
   (setq nodejs-repl-cache-completions ()))
-
-(defun nodejs-repl--set-prompt-deletion-required-p ()
-  (setq nodejs-repl-prompt-deletion-required-p t))
 
 (defun nodejs-repl--remove-duplicated-prompt (_string)
   ;; `.load` command of Node.js repl outputs a duplicated prompt
@@ -311,12 +385,9 @@ when receive the output string."
 
 (defun nodejs-repl--delete-prompt (_string)
   ;; Redundant prompts are included in outputs from Node.js REPL
-  (when (and nodejs-repl-prompt-deletion-required-p
-             ;; To avoid end-of-buffer error at the line of (forward-char (length nodejs-repl-prompt))
-             (> (buffer-size) 0))
+  (when nodejs-repl-prompt-deletion-required-p
     (setq nodejs-repl-prompt-deletion-required-p nil)
-    (let ((beg (or comint-last-output-start
-                   (point-min-marker)))
+    (let ((beg (or comint-last-output-start (point-min-marker)))
           (end (process-mark (get-buffer-process (current-buffer)))))
       (save-excursion
         (goto-char beg)
@@ -368,7 +439,7 @@ when receive the output string."
                  (search-backward-regexp "[[:graph:]]" nil t)
                  (or (sexp-at-point) (intern (char-to-string (char-after)))))))
       (when (member exp nodejs-repl-unary-operators)
-       (search-backward (symbol-name exp) nil)))))
+				(search-backward (symbol-name exp) nil)))))
   (point))
 
 (defun nodejs-repl--backward-expression ()
@@ -426,6 +497,82 @@ when receive the output string."
             nodejs-repl-cache-completions completions))
     completions))
 
+(defun nodejs-repl--process-named-specifiers (self module specifiers)
+  (let ((spec-list (split-string specifiers "[ \t\n\r]*,[ \t\n\r]*" t)))
+    (mapcar
+     (lambda (spec)
+       (let* ((parts (split-string spec "[ \t\n\r]+as[ \t\n\r]+"))
+							(original (string-trim (car parts)))
+              (alias (and (cadr parts) (string-trim (cadr parts)))))
+				 (format "  %s.%s = %s.%s ?? %s.default?.%s;" self (or alias original) module original module original)))
+     (seq-filter (lambda (spec) (not (string-match-p "\\`\\(?:[ \t\n\r]*\\|\\btype[ \t\n\r]+\\S-+\\)[ \t\n\r]*\\'" spec))) spec-list))))
+
+(defun nodejs-repl--import-module-statements (imports file)
+	(let* ((statements (list "((g, m) => {")))
+		(when imports
+			(save-match-data
+				(when (string-match "[ \t\n\r]*{[ \t\n\r]*\\([^}]+\\)[ \t\n\r]*}" imports)
+					(dolist (spec (nodejs-repl--process-named-specifiers "g" "m" (match-string 1 imports)))
+						(push spec statements)))
+				(when (string-match "\\(?:\\`[ \t\n\r]*\\([[:alnum:]_$]+\\)\\)" imports)
+					(push (format "  g.%s = m.default;" (match-string 1 imports)) statements))
+				(when (string-match "\\(?:[ \t\n\r]*\\*[ \t\n\r]+as[ \t\n\r]+\\([[:alnum:]_$]+\\)\\)" imports)
+					(push (format "  g.%s = m.default;" (match-string 1 imports)) statements))
+				)
+			)
+		(push (format "})(globalThis, await import(\"%s\"));" file) statements)
+
+		(mapconcat #'identity (reverse statements) "\n"))
+	)
+
+(defun nodejs-repl--transform-input (code)
+  (when nodejs-repl-transform-imports
+		(while (string-match "^[ \t\r]*import[ \t\n\r]+\\([^\x00]+?\\)?[ \t\n\r]+from[ \t\n\r]+[\"']\\([^\"']+\\)[\"'][ \t\n\r]*;?$" code)
+			(setq code (replace-match (nodejs-repl--import-module-statements (match-string 1 code) (match-string 2 code)) t t code)))
+		(setq code
+					(replace-regexp-in-string "\\(?:^[ \t\r]*export[ \t\n\r]+[^\x00]+?[ \t\n\r]+from[ \t\n\r]+[\"'][^\"']+[\"'][ \t\n\r]*;?$\\)\n?" "" code t t))
+		(setq code
+					(replace-regexp-in-string "^[ \t\r]*export[ \t\n\r]+\\(?:\\bdefault\\b\\)?" "" code t t)))
+	code)
+
+(defconst nodejs-repl--stdin-bytes-threshold 4096
+  "Byte count above which to use a temporary file for evaluation.
+Below this, code is sent directly to the REPL's stdin. This avoids
+stream fragmentation issues with large inputs.")
+
+(defun nodejs-repl--eval (code)
+  "Send CODE to the REPL process for evaluation.
+For code payloads larger than `nodejs-repl--stdin-bytes-threshold`, this
+function writes the code to a temporary file and uses the `.load`
+command to ensure atomic and complete evaluation, avoiding `stdin`
+stream fragmentation issues. Smaller payloads are sent directly."
+  (let ((proc (nodejs-repl--get-or-create-process)))
+    (if (> (string-bytes code) nodejs-repl--stdin-bytes-threshold)
+        (let* ((message-log-max)
+							 (temp-file (make-temp-file "nodejs-repl-eval-" nil ".mjs")))
+          (unwind-protect
+              (progn
+                (with-temp-buffer
+                  (insert (nodejs-repl--transform-input code))
+                  (write-file temp-file))
+                (comint-send-string proc (format ".load %s\n" (shell-quote-argument temp-file)))
+                (nodejs-repl--await proc))
+            (when (file-exists-p temp-file)
+              (delete-file temp-file))))
+      (comint-send-string proc (concat "\n.editor\n" (nodejs-repl--transform-input code) "\x04"))
+      (nodejs-repl--await proc))))
+
+(defun nodejs-repl--query-cwd (proc)
+	(nodejs-repl--interaction proc
+		(when-let* ((output (query "process.cwd()"))
+								(cwd (when (string-match "'\\(/[^']+?\\)'" output)
+											 (match-string 1 output))))
+			(file-name-as-directory cwd))))
+
+(defun nodejs-repl--update-cwd (proc cwd)
+	(nodejs-repl--interaction proc
+		(exec (format "process.chdir(%s);\n" (prin1-to-string cwd)))
+		))
 
 ;;;--------------------------
 ;;; Public functions
@@ -435,46 +582,56 @@ when receive the output string."
   (interactive)
   (process-send-string (get-process nodejs-repl-process-name) "\x03"))
 
-(defun nodejs-repl-clear-line ()
-  "Send ^U to Node.js process."
-  (nodejs-repl--send-string "\x15"))
-
 ;;;###autoload
 (defun nodejs-repl-send-line ()
   "Send the current line to the `nodejs-repl-process'."
   (interactive)
-  (save-excursion
-    (let ((proc (nodejs-repl--get-or-create-process))
-          (start))
-      (beginning-of-line)
-      (setq start (point))
-      (end-of-line)
-      (comint-send-region proc start (point))
-      (comint-send-string proc "\n"))))
+	(nodejs-repl--eval (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+
+;;;###autoload
+(defun nodejs-repl-clear ()
+  "Clear current repl buffer."
+  (interactive)
+	(with-current-buffer (process-buffer (nodejs-repl--get-or-create-process))
+		(comint-clear-buffer)))
 
 ;;;###autoload
 (defun nodejs-repl-send-region (start end)
   "Send the current region from START to END to the `nodejs-repl-process'."
   (interactive "r")
-  (let ((proc (nodejs-repl--get-or-create-process)))
-    ;; Enclose the region in .editor ... EOF as this is more robust.
-    ;; See: https://github.com/abicky/nodejs-repl.el/issues/17
-    (comint-send-string proc ".editor\n")
-    (comint-send-region proc start end)
-    (comint-send-string proc "\n\x04")))
+	(nodejs-repl--eval (buffer-substring-no-properties start end)))
 
 ;;;###autoload
 (defun nodejs-repl-send-buffer ()
-  "Send the current buffer to the `nodejs-repl-process'."
+  "Send the current buffer to the `nodejs-repl-process'.
+This function changes the Node.js REPL's CWD to the
+directory of the current buffer's file before evaluation
+to allow relative imports to resolve correctly."
   (interactive)
-  (nodejs-repl-send-region (point-min) (point-max)))
+  (let* ((proc (nodejs-repl--get-or-create-process))
+         (code (buffer-string))
+				 (bfn (buffer-file-name))
+         (buf-cwd (and bfn (file-name-directory bfn)))
+         (original-cwd (nodejs-repl--query-cwd proc))
+         (new-cwd (and original-cwd (not (equal original-cwd buf-cwd)) buf-cwd)))
+    (when new-cwd (nodejs-repl--update-cwd proc new-cwd))
+    (nodejs-repl--eval code)))
 
 ;;;###autoload
 (defun nodejs-repl-load-file (file)
-  "Load the FILE to the `nodejs-repl-process'."
-  (interactive (list (expand-file-name (read-file-name "Load file: " nil nil 'lambda))))
+  "Load the file to the `nodejs-repl-process'"
+  (interactive (list (expand-file-name (read-file-name "Load file: " default-directory nil t buffer-file-name))))
   (let ((proc (nodejs-repl--get-or-create-process)))
     (comint-send-string proc (format ".load %s\n" file))))
+
+;;;###autoload
+(defun nodejs-repl-reload-file (bfn)
+  "Load the file to the `nodejs-repl-process'"
+  (interactive (list (buffer-file-name (buffer-base-buffer))))
+  (when (file-exists-p bfn)
+    (let ((proc (nodejs-repl--get-or-create-process)))
+      (comint-send-string proc (format "delete require.cache['%s']\n" bfn))
+      (comint-send-string proc (format "require('%s')\n" bfn)))))
 
 ;;;###autoload
 (defun nodejs-repl-send-last-expression ()
@@ -492,7 +649,8 @@ when receive the output string."
 
 (defun nodejs-repl-execute (command &optional _buf)
   "Execute a COMMAND and output the result to the temporary buffer."
-  (let ((ret (nodejs-repl--send-string (concat command "\n"))))
+  (let* ((proc (nodejs-repl--get-or-create-process))
+				 (ret (nodejs-repl--send-string proc (concat command "\n"))))
     (with-current-buffer (get-buffer-create nodejs-repl-temp-buffer-name)
       (erase-buffer)
       (setq ret (replace-regexp-in-string nodejs-repl-ansi-color-sequence-re "" ret))
@@ -510,13 +668,13 @@ when receive the output string."
   (set (make-local-variable 'font-lock-defaults) '(nil nil t))
   (add-hook 'comint-output-filter-functions 'nodejs-repl--delete-prompt nil t)
   (add-hook 'comint-output-filter-functions 'nodejs-repl--remove-duplicated-prompt nil t)
-  (add-hook 'comint-output-filter-functions 'nodejs-repl--filter-escape-sequnces nil t)
+  (add-hook 'comint-output-filter-functions 'nodejs-repl--filter-escape-sequences nil t)
   (add-hook 'comint-output-filter-functions 'nodejs-repl--clear-cache nil t)
   (setq comint-input-ignoredups nodejs-repl-input-ignoredups)
   (setq comint-process-echoes nodejs-repl-process-echoes)
   (add-hook 'completion-at-point-functions 'nodejs-repl--completion-at-point-function nil t)
-  (make-local-variable 'window-configuration-change-hook)
-  (add-hook 'window-configuration-change-hook 'nodejs-repl--set-prompt-deletion-required-p)
+  ;; (make-local-variable 'window-configuration-change-hook)
+  ;; (add-hook 'window-configuration-change-hook 'nodejs-repl--set-prompt-deletion-required-p)
   (ansi-color-for-comint-mode-on))
 
 ;;;###autoload
@@ -529,18 +687,23 @@ when receive the output string."
                         nodejs-repl-command)))
     (setq nodejs-repl-prompt-re
           (format nodejs-repl-prompt-re-format nodejs-repl-prompt nodejs-repl-prompt))
-    (setq nodejs-repl-nodejs-version
-          ;; "v7.3.0" => "7.3.0", "v7.x-dev" => "7"
-          (replace-regexp-in-string nodejs-repl--nodejs-version-re "\\1"
-                                    (shell-command-to-string (concat node-command " --version"))))
-    (let* ((repl-mode (or (getenv "NODE_REPL_MODE") "sloppy"))
-           (nodejs-repl-code (format nodejs-repl-code-format
-                                     nodejs-repl-prompt nodejs-repl-use-global repl-mode)))
+    ;; (setq nodejs-repl-nodejs-version
+    ;;       ;; "v7.3.0" => "7.3.0", "v7.x-dev" => "7"
+    ;;       (replace-regexp-in-string nodejs-repl--nodejs-version-re "\\1"
+    ;;                                 (shell-command-to-string (concat node-command " --version"))))
+    (let* ((process-environment (cl-copy-list process-environment))
+           (repl-mode (or (getenv "NODE_REPL_MODE") "sloppy")))
+      (cl-loop
+       for (var . value) in nodejs-repl-env
+       do (setenv var value))
       (pop-to-buffer
-       ;; Node.js 12 ignores almost all keys if TERM is "dumb"
-       ;; cf. https://github.com/nodejs/node/commit/d3a62fe7fc683bf74b3e9c743f73471f0167bd15
-       (apply 'make-comint nodejs-repl-process-name "env" nil
-              `("TERM=xterm" ,node-command ,@nodejs-repl-arguments "-e" ,nodejs-repl-code)))
+       (apply 'make-comint nodejs-repl-process-name node-command nil
+              (append
+               nodejs-repl-arguments
+               (when nodejs-repl-code-format
+                 (list "-e" (format nodejs-repl-code-format nodejs-repl-prompt nodejs-repl-use-global repl-mode))))
+              ))
+      (process-put (get-process nodejs-repl-process-name) 'adjust-window-size-function #'ignore)
       (nodejs-repl-mode))))
 
 (defvar nodejs-repl-minor-mode-map

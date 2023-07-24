@@ -28,13 +28,13 @@
            (orig-marker (marker-position (process-mark proc)))
            (orig-filter (process-filter proc))
            (orig-buf (process-buffer proc)))
-      (nodejs-repl--send-string "1 +\n1\n")
+      (nodejs-repl--send-string proc "1 +\n1\n")
       (list
        (eq orig-marker (marker-position (process-mark proc)))
        (eq orig-filter (process-filter proc))
        (eq orig-buf (process-buffer proc)))))
   (expect '("2" "undefined")  ; waits for finishing commands
-    (let* ((ret (nodejs-repl--send-string "s = Date.now(); while ((d = (Date.now() - s) / 1000 | 0) < 2); console.log(d)\n"))
+    (let* ((ret (nodejs-repl--send-string proc "s = Date.now(); while ((d = (Date.now() - s) / 1000 | 0) < 2); console.log(d)\n"))
            (i-value (nth 1 (split-string ret "\r\n")))
            (return-value (nth 2 (split-string ret "\r\n"))))
       (list
