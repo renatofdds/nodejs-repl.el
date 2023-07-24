@@ -99,17 +99,14 @@
   (expect '("require")
     (nodejs-repl--get-completions "requi"))
   (expect t
-    (> (length (let ((nodejs-repl-get-completions-for-require-p t))
-                 (nodejs-repl--get-completions ""))) 1))
+    (> (length (nodejs-repl--get-completions "")) 1))
   (expect "require('"  ; update cache?
     nodejs-repl-cache-token)
   (expect "require('"  ; use cache?
-    (let ((nodejs-repl-get-completions-for-require-p t))
-      (nodejs-repl--get-completions "f"))
+		(nodejs-repl--get-completions "f")
     nodejs-repl-cache-token)
   (expect "require('npm/"  ; update cache?
-    (let ((nodejs-repl-get-completions-for-require-p t))
-      (nodejs-repl--get-completions "npm/"))
+    (nodejs-repl--get-completions "npm/")
     nodejs-repl-cache-token)
 
   (desc "nodejs-repl--extract-require-argument")

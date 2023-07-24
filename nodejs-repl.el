@@ -23,7 +23,6 @@
 ;; This program is derived from comint-mode and provides the following features.
 ;;
 ;;  * Token completion, same as Node.js REPL
-;;  * File name completion in string
 ;;  * Incremental history search
 ;;  * Sending JavaScript code to REPL
 ;;
@@ -185,7 +184,6 @@ See also `comint-process-echoes'"
 (defvar nodejs-repl-cache-token "")
 (defvar nodejs-repl-cache-completions ())
 
-(defvar nodejs-repl-get-completions-for-require-p nil)
 (defvar nodejs-repl-prompt-deletion-required-p nil)
 
 ;;;--------------------------
@@ -317,41 +315,6 @@ when receive the output string."
     (goto-char (point-max))
     (process-put proc 'last-line (buffer-substring (line-beginning-position) (point)))))
 
-(defun nodejs-repl--get-completions-from-process (token)
-  "Get completions for prefix TOKEN by sending TAB to Node.js process."
-  (let* ((proc (get-process nodejs-repl-process-name))
-				 (ret (progn
-								;; Send TAB twice cf. https://github.com/nodejs/node/pull/7754
-								(nodejs-repl--send-string proc (concat token "\t"))
-								(nodejs-repl--send-string proc "\t")))
-         completions)
-    (nodejs-repl--send-string proc "\x1\xb") ; Send ^A ^K to clear line
-    (when (not (equal ret token))
-      (if (string-match-p "\n" ret)
-          (progn
-            ;; remove extra substrings
-            (setq ret (replace-regexp-in-string "\r" "" ret))
-            ;; remove LF
-            (setq ret (replace-regexp-in-string "\n\\{2,\\}" "\n" ret))
-            ;; trim trailing whitespaces
-            (setq ret (replace-regexp-in-string "[ \t\r\n]*\\'" "" ret))
-            ;; don't split by whitespaces because the prompt might have whitespaces!!
-            (setq completions (split-string ret "\n"))
-            ;; remove the first element (input) and the last element (prompt)
-            (setq completions (reverse (cdr (reverse (cdr completions)))))
-            ;; split by whitespaces
-            ;; '("encodeURI     encodeURIComponent") -> '("encodeURI" "encodeURIComponent")
-            (setq completions (split-string
-                               (replace-regexp-in-string " *$" "" (mapconcat 'identity completions " "))
-                               "[ \t\r\n]+"))
-            )
-        (setq ret (replace-regexp-in-string nodejs-repl-extra-espace-sequence-re "" ret))
-        (let ((candidate-token (nodejs-repl--get-last-token ret)))
-          (setq completions (if (or (null candidate-token) (equal candidate-token token))
-                                nil
-                              (list candidate-token))))))
-    completions))
-
 (defun nodejs-repl--get-or-create-process ()
   (or (get-process nodejs-repl-process-name)
 			(save-excursion
@@ -455,46 +418,61 @@ when receive the output string."
 
 (defun nodejs-repl--completion-at-point-function ()
   (setq nodejs-repl-prompt-deletion-required-p t)
-  (when (comint-after-pmark-p)
-    (let* ((input (buffer-substring (comint-line-beginning-position) (point)))
-           require-arg
-           token-length
-           file-completion-p)
-      (setq nodejs-repl-get-completions-for-require-p nil)  ;; reset
-      (if (not (nodejs-repl--in-string-p))
-          (setq token-length (length (nodejs-repl--get-last-token input)))
-        (setq require-arg (nodejs-repl--extract-require-argument input)
-              nodejs-repl-get-completions-for-require-p t)
-        (if (and require-arg
-                 (or (= (length require-arg) 1)  ; only quote or double quote
-                     (not (string-match-p "[./]" (substring require-arg 1 2)))))  ; not file path
-            (setq token-length (1- (length require-arg)))
-          (let ((quote-pos (save-excursion
-                             (search-backward-regexp "['\"]" (line-beginning-position) t)
-                             (forward-char)
-                             (point))))
-            (when quote-pos
-              (setq file-completion-p t
-                    token-length (- (point) quote-pos))))))
-      (when token-length
-        (list
-         (save-excursion (backward-char token-length) (point))
-         (point)
-         (if file-completion-p
-             #'completion-file-name-table
-           (completion-table-dynamic #'nodejs-repl--get-completions)))))))
+  (when-let* (((comint-after-pmark-p))
+							(beg (comint-line-beginning-position))
+							(input (buffer-substring beg (point)))
+							(token (if-let ((require-arg (nodejs-repl--extract-require-argument input)))
+												 (format "require(%s)" require-arg)
+											 (and (not (nodejs-repl--in-string-p))
+														(nodejs-repl--get-last-token input))))
+							(token-length (length token)))
+		(list
+		 (- (point) token-length)
+		 (point)
+		 (completion-table-dynamic (lambda (_) (nodejs-repl--get-completions token))))))
 
 (defun nodejs-repl--get-completions (token)
-  (let (completions)
-    (when nodejs-repl-get-completions-for-require-p
-      (setq token (concat "require('" token)))
-    (if (and (not (equal nodejs-repl-cache-token ""))
-             (string-prefix-p nodejs-repl-cache-token token)
-             (not (string-match-p (concat "^" nodejs-repl-cache-token ".*?[.(/'\"]") token)))
-        (setq completions nodejs-repl-cache-completions)
-      (setq completions (nodejs-repl--get-completions-from-process token)
-            nodejs-repl-cache-token token
-            nodejs-repl-cache-completions completions))
+  (or (and (not (string= nodejs-repl-cache-token ""))
+           (string-prefix-p nodejs-repl-cache-token token)
+           (not (string-match-p (concat "\\`" (regexp-quote nodejs-repl-cache-token) ".*[.(/'\"]") token))
+					 nodejs-repl-cache-completions)
+			(setq
+			 nodejs-repl-cache-token token
+			 nodejs-repl-cache-completions (nodejs-repl--get-completions-from-process token))))
+
+(defun nodejs-repl--get-completions-from-process (token)
+  "Get completions for prefix TOKEN by sending TAB to Node.js process."
+  (let* ((proc (get-process nodejs-repl-process-name))
+				 (ret (progn
+								;; Send TAB twice cf. https://github.com/nodejs/node/pull/7754
+								(nodejs-repl--send-string proc (concat token "\t"))
+								(nodejs-repl--send-string proc "\t")))
+         completions)
+    (nodejs-repl--send-string proc "\x1\xb") ; Send ^A ^K to clear line
+    (when (not (equal ret token))
+      (if (string-match-p "\n" ret)
+          (progn
+            ;; remove extra substrings
+            (setq ret (replace-regexp-in-string "\r" "" ret))
+            ;; remove LF
+            (setq ret (replace-regexp-in-string "\n\\{2,\\}" "\n" ret))
+            ;; trim trailing whitespaces
+            (setq ret (replace-regexp-in-string "[ \t\r\n]*\\'" "" ret))
+            ;; don't split by whitespaces because the prompt might have whitespaces!!
+            (setq completions (split-string ret "\n"))
+            ;; remove the first element (input) and the last element (prompt)
+            (setq completions (reverse (cdr (reverse (cdr completions)))))
+            ;; split by whitespaces
+            ;; '("encodeURI     encodeURIComponent") -> '("encodeURI" "encodeURIComponent")
+            (setq completions (split-string
+                               (replace-regexp-in-string " *$" "" (mapconcat 'identity completions " "))
+                               "[ \t\r\n]+"))
+            )
+        (setq ret (replace-regexp-in-string nodejs-repl-extra-espace-sequence-re "" ret))
+        (let ((candidate-token (nodejs-repl--get-last-token ret)))
+          (setq completions (if (or (null candidate-token) (equal candidate-token token))
+                                nil
+                              (list candidate-token))))))
     completions))
 
 (defun nodejs-repl--process-named-specifiers (self module specifiers)
