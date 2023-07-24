@@ -87,6 +87,11 @@ such as nvm."
   :group 'nodejs-repl
   :type '(repeat string))
 
+(defcustom nodejs-repl-node-path '()
+  "NODE_PATH environment to be used."
+  :group 'nodejs-repl
+  :type '(repeat (string :tag "Path")))
+
 (defcustom nodejs-repl-prompt "> "
   "Node.js prompt used in `nodejs-repl-mode'."
   :group 'nodejs-repl
@@ -274,11 +279,10 @@ when receive the output string."
     completions))
 
 (defun nodejs-repl--get-or-create-process ()
-  (let ((proc (get-process nodejs-repl-process-name)))
-    (unless (processp proc)
-      (save-excursion (nodejs-repl))
-      (setq proc (get-process nodejs-repl-process-name)))
-    proc))
+  (or (get-process nodejs-repl-process-name)
+			(save-excursion
+				(nodejs-repl)
+				(get-process nodejs-repl-process-name))))
 
 (defun nodejs-repl--filter-escape-sequnces (_string)
   "Filter extra escape sequences from output."
@@ -296,9 +300,6 @@ when receive the output string."
   (setq nodejs-repl-cache-token "")
   (setq nodejs-repl-cache-completions ()))
 
-(defun nodejs-repl--set-prompt-deletion-required-p ()
-  (setq nodejs-repl-prompt-deletion-required-p t))
-
 (defun nodejs-repl--remove-duplicated-prompt (_string)
   ;; `.load` command of Node.js repl outputs a duplicated prompt
   (let ((beg (or comint-last-output-start
@@ -311,12 +312,9 @@ when receive the output string."
 
 (defun nodejs-repl--delete-prompt (_string)
   ;; Redundant prompts are included in outputs from Node.js REPL
-  (when (and nodejs-repl-prompt-deletion-required-p
-             ;; To avoid end-of-buffer error at the line of (forward-char (length nodejs-repl-prompt))
-             (> (buffer-size) 0))
+  (when nodejs-repl-prompt-deletion-required-p
     (setq nodejs-repl-prompt-deletion-required-p nil)
-    (let ((beg (or comint-last-output-start
-                   (point-min-marker)))
+    (let ((beg (or comint-last-output-start (point-min-marker)))
           (end (process-mark (get-buffer-process (current-buffer)))))
       (save-excursion
         (goto-char beg)
@@ -426,7 +424,6 @@ when receive the output string."
             nodejs-repl-cache-completions completions))
     completions))
 
-
 ;;;--------------------------
 ;;; Public functions
 ;;;--------------------------
@@ -436,21 +433,17 @@ when receive the output string."
   (process-send-string (get-process nodejs-repl-process-name) "\x03"))
 
 (defun nodejs-repl-clear-line ()
-  "Send ^U to Node.js process."
-  (nodejs-repl--send-string "\x15"))
+  "Send ^A ^K to Node.js process."
+  (nodejs-repl--send-string "\x1\xb"))
 
 ;;;###autoload
 (defun nodejs-repl-send-line ()
   "Send the current line to the `nodejs-repl-process'."
   (interactive)
   (save-excursion
-    (let ((proc (nodejs-repl--get-or-create-process))
-          (start))
-      (beginning-of-line)
-      (setq start (point))
-      (end-of-line)
-      (comint-send-region proc start (point))
-      (comint-send-string proc "\n"))))
+    (let ((proc (nodejs-repl--get-or-create-process)))
+			(comint-send-region proc (line-beginning-position) (line-end-position))
+			(comint-send-string proc "\n"))))
 
 ;;;###autoload
 (defun nodejs-repl-send-region (start end)
@@ -471,8 +464,8 @@ when receive the output string."
 
 ;;;###autoload
 (defun nodejs-repl-load-file (file)
-  "Load the FILE to the `nodejs-repl-process'."
-  (interactive (list (expand-file-name (read-file-name "Load file: " nil nil 'lambda))))
+  "Load the file to the `nodejs-repl-process'"
+  (interactive (list (expand-file-name (read-file-name "Load file: " default-directory nil t buffer-file-name))))
   (let ((proc (nodejs-repl--get-or-create-process)))
     (comint-send-string proc (format ".load %s\n" file))))
 
@@ -515,8 +508,8 @@ when receive the output string."
   (setq comint-input-ignoredups nodejs-repl-input-ignoredups)
   (setq comint-process-echoes nodejs-repl-process-echoes)
   (add-hook 'completion-at-point-functions 'nodejs-repl--completion-at-point-function nil t)
-  (make-local-variable 'window-configuration-change-hook)
-  (add-hook 'window-configuration-change-hook 'nodejs-repl--set-prompt-deletion-required-p)
+  ;; (make-local-variable 'window-configuration-change-hook)
+  ;; (add-hook 'window-configuration-change-hook 'nodejs-repl--set-prompt-deletion-required-p)
   (ansi-color-for-comint-mode-on))
 
 ;;;###autoload
@@ -528,19 +521,22 @@ when receive the output string."
                           (funcall nodejs-repl-command)
                         nodejs-repl-command)))
     (setq nodejs-repl-prompt-re
-          (format nodejs-repl-prompt-re-format nodejs-repl-prompt nodejs-repl-prompt))
-    (setq nodejs-repl-nodejs-version
-          ;; "v7.3.0" => "7.3.0", "v7.x-dev" => "7"
-          (replace-regexp-in-string nodejs-repl--nodejs-version-re "\\1"
-                                    (shell-command-to-string (concat node-command " --version"))))
-    (let* ((repl-mode (or (getenv "NODE_REPL_MODE") "sloppy"))
-           (nodejs-repl-code (format nodejs-repl-code-format
-                                     nodejs-repl-prompt nodejs-repl-use-global repl-mode)))
+					(format nodejs-repl-prompt-re-format nodejs-repl-prompt nodejs-repl-prompt))
+    ;; (setq nodejs-repl-nodejs-version
+    ;;       ;; "v7.3.0" => "7.3.0", "v7.x-dev" => "7"
+    ;;       (replace-regexp-in-string nodejs-repl--nodejs-version-re "\\1"
+    ;;                                 (shell-command-to-string (concat node-command " --version"))))
+    (let* ((process-environment (cl-copy-list process-environment))
+					 (nodepath (mapconcat #'identity nodejs-repl-node-path ":"))
+					 (repl-mode (or (getenv "NODE_REPL_MODE") "sloppy"))
+					 (nodejs-repl-code (format nodejs-repl-code-format
+																		 nodejs-repl-prompt nodejs-repl-use-global repl-mode)))
+			(unless (string= nodepath "")
+				(setenv "NODE_PATH" nodepath))
       (pop-to-buffer
-       ;; Node.js 12 ignores almost all keys if TERM is "dumb"
-       ;; cf. https://github.com/nodejs/node/commit/d3a62fe7fc683bf74b3e9c743f73471f0167bd15
-       (apply 'make-comint nodejs-repl-process-name "env" nil
-              `("TERM=xterm" ,node-command ,@nodejs-repl-arguments "-e" ,nodejs-repl-code)))
+       (apply 'make-comint nodejs-repl-process-name node-command nil
+							`(,@nodejs-repl-arguments "-e" ,nodejs-repl-code)))
+			(process-put (get-process nodejs-repl-process-name) 'adjust-window-size-function #'ignore)
       (nodejs-repl-mode))))
 
 (defvar nodejs-repl-minor-mode-map
