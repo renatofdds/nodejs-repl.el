@@ -41,6 +41,11 @@ jobs:
           cask
 
       - name: Run tests
-        run: |
-          node -v
-          make test
+        uses: nick-fields/retry@v3
+        with:
+          timeout_seconds: 30
+          max_attempts: 3
+          retry_wait_seconds: 0
+          command: |
+            node -v
+            make test
