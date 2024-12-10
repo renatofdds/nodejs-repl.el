@@ -19,9 +19,12 @@ jobs:
           - '28.2'
           - '29.1'
           - '29.2'
+          - '29.3'
+          - '29.4'
         node-version:
           - '18'
           - '20'
+          - '22'
     steps:
       - uses: actions/checkout@v4
       - uses: purcell/setup-emacs@master
